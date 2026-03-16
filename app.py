@@ -32,7 +32,11 @@ def detect_languages(text):
     }
     
     # 上下文相关关键词（表示"使用之前的语言"）
-    context_keywords = ["继续", "上面提到的", "之前提到的", "刚才", "同样的", "一样的", "刚才说的", "之前说"]
+    context_keywords = [
+        "继续", "上面提到的", "之前提到的", "刚才", "同样的", "一样的", "刚才说的", "之前说",
+        "上面一样的语言", "上面一样的", "翻译成上面一样的", "翻译成上面一样的语言",
+        "和上面一样", "跟上面一样", "同上", "相同语言", "一样语言"
+    ]
     
     text_lower = text.lower()
     
@@ -49,6 +53,13 @@ def detect_languages(text):
         # 尝试从 session_state 获取之前的目标语言
         if "last_langs" in st.session_state and st.session_state.last_langs:
             return st.session_state.last_langs, True  # True 表示是上下文引用
+        
+        # 如果没有当前语言，从历史记录中查找最近的目标语言
+        if st.session_state.translation_history:
+            # 查找最近一次翻译的目标语言
+            for item in reversed(st.session_state.translation_history):
+                if "langs" in item and item["langs"]:
+                    return item["langs"], True
     
     return [], False
 
@@ -75,21 +86,81 @@ def detect_document_reference(text):
     return is_doc_reference
 
 
-def find_text_column(df):
+def find_text_column(df, api_key):
+    """
+    使用大模型智能判断哪列需要翻译
+    """
+    # 如果只有一列，直接返回
+    if len(df.columns) == 1:
+        return df.columns[0]
+    
+    # 准备列信息
+    columns_info = []
+    for col in df.columns:
+        samples = df[col].dropna().head(3).tolist()
+        samples_str = "\n  ".join([str(s)[:50] + ("..." if len(str(s)) > 50 else "") for s in samples])
+        columns_info.append(f"列名: {col}\n   样本:\n   {samples_str}")
+    
+    columns_text = "\n\n".join(columns_info)
+    
+    prompt = f"""分析CSV列，选择需要翻译的文本列：
+
+{columns_text}
+
+返回JSON：{{"target_column": "列名"}}
+
+标准：优先中文/日文/韩文文本，避免数字/日期/ID"""
+    
+    try:
+        openai.api_key = api_key
+        openai.api_base = "https://api.deepseek.com"
+        
+        response = openai.ChatCompletion.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "数据分析专家"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=200
+        )
+        
+        content = response.choices[0].message.content
+        
+        try:
+            result = json.loads(content)
+            target_col = result.get("target_column")
+            if target_col in df.columns:
+                return target_col
+        except:
+            pass
+        
+        import re
+        match = re.search(r'"target_column"\s*:\s*"([^"]+)"', content)
+        if match:
+            target_col = match.group(1)
+            if target_col in df.columns:
+                return target_col
+        
+    except:
+        pass
+    
+    # 兜底：关键词匹配
     for col in df.columns:
         if any(k in str(col).lower() for k in ["中文", "内容", "文本", "原文", "text"]):
             return col
+    
     return df.columns[0]
 
 
-def get_data_source(uploaded_file, use_history=False):
+def get_data_source(uploaded_file, use_history=False, api_key=None):
     """
     获取数据源：优先使用上传的文件，如果没有则从历史记录获取
     """
     # 如果有新上传的文件，优先使用
     if uploaded_file is not None and not use_history:
         df = read_csv_with_encoding(uploaded_file)
-        col = find_text_column(df)
+        col = find_text_column(df, api_key)
         return df, col, "新上传的文件"
     
     # 尝试从历史记录获取原始数据
@@ -97,7 +168,7 @@ def get_data_source(uploaded_file, use_history=False):
         last_item = st.session_state.translation_history[-1]
         if "source_df" in last_item:
             df = last_item["source_df"].copy()
-            col = last_item.get("text_col", find_text_column(df))
+            col = last_item.get("text_col", find_text_column(df, api_key))
             return df, col, "历史记录中的文档"
     
     return None, None, None
@@ -110,7 +181,6 @@ def translate_batch(texts, target_lang):
 文本：{json.dumps(texts, ensure_ascii=False)}"""
     
     try:
-        print(f"正在翻译到 {target_lang}，文本数量: {len(texts)}")
         response = openai.ChatCompletion.create(
             model="deepseek-chat",
             messages=[
@@ -122,7 +192,6 @@ def translate_batch(texts, target_lang):
         )
         
         content = response.choices[0].message.content
-        print(f"API 响应: {content[:100]}...")
         try:
             result = json.loads(content)
             if "translations" in result:
@@ -143,13 +212,10 @@ def translate_batch(texts, target_lang):
         return texts
     except Exception as e:
         st.error(f"翻译出错：{e}")
-        print(f"详细错误: {e}")
         return texts
 
 
 def process_translation(df, text_col, langs, api_key):
-    print(f"开始翻译: {len(df)} 行, 目标语言: {langs}")
-    print(f"API Key: {api_key[:20]}...")
     openai.api_key = api_key
     openai.api_base = "https://api.deepseek.com"
     
@@ -221,7 +287,7 @@ st.markdown("""
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
-    st.markdown("##  上传文件")
+    st.markdown("## 📤 上传文件")
     uploaded_file = st.file_uploader("CSV 文件", type=["csv"])
     
     if uploaded_file:
@@ -300,7 +366,7 @@ if user_input := st.chat_input("输入翻译需求..."):
         else:
             # 使用数据源（上传的文件或历史记录）
             use_history = is_doc_ref and not has_uploaded_file and has_history
-            df, col, source_info = get_data_source(uploaded_file, use_history=use_history)
+            df, col, source_info = get_data_source(uploaded_file, use_history=use_history, api_key=api_key)
             
             if df is None:
                 st.error("❌ 无法获取数据源")
